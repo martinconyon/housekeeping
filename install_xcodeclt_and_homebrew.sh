@@ -1,32 +1,28 @@
 #!/usr/bin/env bash
-# Purpose: Non-interactive install of Xcode Command Line Tools (CLT) + Homebrew on Apple Silicon.
-# Usage after download:
+# Non-interactive install of Xcode Command Line Tools (CLT) + Homebrew on Apple Silicon.
+# Usage:
 #   bash ./install_xcodeclt_and_homebrew.sh
-# The script self-elevates with sudo and runs to completion without prompts.
-
 set -euo pipefail
 
 log(){ printf '[%s] %s\n' "$(date +'%H:%M:%S')" "$*"; }
 die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# 0) Require Apple Silicon; self-elevate with sudo
+# Apple Silicon + self-elevate
 [[ "$(uname -m)" == "arm64" ]] || die "Apple Silicon (arm64) required."
 if [[ "${EUID}" -ne 0 ]]; then exec sudo -E bash "$0" "$@"; fi
 
-# 1) Resolve invoking user and HOME (for writing shell profiles)
+# Resolve invoking user and HOME
 INVOKER="${SUDO_USER:-$USER}"
 INV_HOME="$(eval echo ~"${INVOKER}")"
 [[ -d "${INV_HOME}" ]] || die "Cannot resolve HOME for ${INVOKER}"
+log "Running as root; target user=${INVOKER} HOME=${INV_HOME}"
 
-log "Running as root for installs; targeting user=${INVOKER} HOME=${INV_HOME}"
-
-# 2) Helpers
+# ---- CLT ----
 have_clt(){ /usr/bin/xcode-select -p >/dev/null 2>&1 && pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1; }
 install_clt(){
-  if have_clt; then log "Xcode Command Line Tools already installed."; return; fi
+  if have_clt; then log "CLT already installed."; return; fi
   log "Installing Xcode Command Line Tools (non-interactive)…"
   touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-  # Try up to 6 passes to tolerate Apple’s listing delays/format changes
   label=""
   for _ in 1 2 3 4 5 6; do
     label="$(softwareupdate -l 2>/dev/null \
@@ -47,31 +43,32 @@ install_clt(){
   log "CLT installed."
 }
 
+# ---- Homebrew ----
 have_brew(){ [[ -x /opt/homebrew/bin/brew ]]; }
 install_brew(){
-  if have_brew; then log "Homebrew already installed at /opt/homebrew."; else
+  if have_brew; then
+    log "Homebrew already installed at /opt/homebrew."
+  else
     log "Installing Homebrew (non-interactive)…"
     mkdir -p /opt/homebrew
     chown -R "${INVOKER}":staff /opt/homebrew
-    # Run official installer as the invoking user so files are owned correctly
     sudo -u "${INVOKER}" NONINTERACTIVE=1 /bin/bash -c \
       "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     log "Homebrew installed."
   fi
 
-  # Wire shell env for the invoking user (zsh + bash)
-  for f in "${INV_HOME}/.zprofile" "${INV_HOME}/.bash_profile"; do
+  # Wire zsh + bash for invoking user; idempotent
+  for f in "${INV_HOME}/.zprofile" "${INV_HOME}/.zshrc" "${INV_HOME}/.bash_profile"; do
     grep -q '/opt/homebrew/bin/brew shellenv' "$f" 2>/dev/null || \
       echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$f"
     chown "${INVOKER}":staff "$f" 2>/dev/null || true
   done
 
-  # Also export to current process so subsequent steps (if any) see brew
+  # Apply for current process as invoking user
   sudo -u "${INVOKER}" bash -lc 'eval "$(/opt/homebrew/bin/brew shellenv)"; brew analytics off >/dev/null 2>&1 || true; brew update'
   log "Homebrew ready."
 }
 
 install_clt
 install_brew
-
 log "Done."
