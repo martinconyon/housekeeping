@@ -1,99 +1,77 @@
 #!/usr/bin/env bash
-# Installs Xcode Command Line Tools (CLT) and Homebrew non-interactively.
-# Apple Silicon only. Run once, with sudo, on a fresh macOS.
-# Usage:
-#   sudo bash install_xcodeclt_and_homebrew.sh
+# Purpose: Non-interactive install of Xcode Command Line Tools (CLT) + Homebrew on Apple Silicon.
+# Usage after download:
+#   bash ./install_xcodeclt_and_homebrew.sh
+# The script self-elevates with sudo and runs to completion without prompts.
 
 set -euo pipefail
 
-log() { printf '%s\n' "[$(date +'%H:%M:%S')] $*"; }
+log(){ printf '[%s] %s\n' "$(date +'%H:%M:%S')" "$*"; }
+die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-require_arm64() {
-  [[ "$(uname -m)" == "arm64" ]] || { echo "ERROR: Apple Silicon (arm64) required."; exit 1; }
-}
+# 0) Require Apple Silicon; self-elevate with sudo
+[[ "$(uname -m)" == "arm64" ]] || die "Apple Silicon (arm64) required."
+if [[ "${EUID}" -ne 0 ]]; then exec sudo -E bash "$0" "$@"; fi
 
-have_clt() {
-  # Returns 0 if CLT present
-  /usr/bin/xcode-select -p >/dev/null 2>&1 && pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1
-}
+# 1) Resolve invoking user and HOME (for writing shell profiles)
+INVOKER="${SUDO_USER:-$USER}"
+INV_HOME="$(eval echo ~"${INVOKER}")"
+[[ -d "${INV_HOME}" ]] || die "Cannot resolve HOME for ${INVOKER}"
 
-install_clt() {
-  if have_clt; then
-    log "Xcode Command Line Tools already installed."
-    return
-  fi
+log "Running as root for installs; targeting user=${INVOKER} HOME=${INV_HOME}"
+
+# 2) Helpers
+have_clt(){ /usr/bin/xcode-select -p >/dev/null 2>&1 && pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1; }
+install_clt(){
+  if have_clt; then log "Xcode Command Line Tools already installed."; return; fi
   log "Installing Xcode Command Line Tools (non-interactive)…"
   touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-
-  # Find the latest "Command Line Tools for Xcode-*" label
-  CLT_LABEL="$(softwareupdate -l 2>/dev/null | awk -F"[*] " '/\* Command Line Tools for Xcode-/{print $2}' | sort -V | tail -n1 || true)"
-  if [[ -z "${CLT_LABEL}" ]]; then
-    rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-    echo "ERROR: Could not find a Command Line Tools label via softwareupdate."
-    exit 2
-  fi
-
-  log "Selected CLT label: ${CLT_LABEL}"
-  softwareupdate -i "${CLT_LABEL}" --verbose
+  # Try up to 6 passes to tolerate Apple’s listing delays/format changes
+  label=""
+  for _ in 1 2 3 4 5 6; do
+    label="$(softwareupdate -l 2>/dev/null \
+      | sed -n 's/.*Label: \(Command Line Tools for Xcode-[^,]*\).*/\1/p' \
+      | sort -V | tail -n1 || true)"
+    [[ -n "${label}" ]] && break
+    label="$(softwareupdate -l 2>/dev/null \
+      | grep -Eo 'Command Line Tools for Xcode-[0-9][0-9\.]*' \
+      | sort -V | tail -n1 || true)"
+    [[ -n "${label}" ]] && break
+    sleep 5
+  done
+  [[ -n "${label}" ]] || { rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress; die "Could not discover CLT label from softwareupdate."; }
+  log "Selected label: ${label}"
+  softwareupdate -i "${label}" --verbose
   rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-
-  # Point xcode-select at CLT
   /usr/bin/xcode-select --switch /Library/Developer/CommandLineTools
   log "CLT installed."
 }
 
-have_brew() {
-  [[ -x /opt/homebrew/bin/brew ]]
-}
-
-install_brew() {
-  if have_brew; then
-    log "Homebrew already installed at /opt/homebrew."
-  else
+have_brew(){ [[ -x /opt/homebrew/bin/brew ]]; }
+install_brew(){
+  if have_brew; then log "Homebrew already installed at /opt/homebrew."; else
     log "Installing Homebrew (non-interactive)…"
-    # Pre-create directories so the installer won't prompt for sudo
     mkdir -p /opt/homebrew
-    chown -R "$(id -u)":"$(id -g)" /opt/homebrew
-
-    # Run official installer without prompts
-    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
+    chown -R "${INVOKER}":staff /opt/homebrew
+    # Run official installer as the invoking user so files are owned correctly
+    sudo -u "${INVOKER}" NONINTERACTIVE=1 /bin/bash -c \
+      "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     log "Homebrew installed."
   fi
 
-  # Set up shell environment for current user
-  if ! grep -q '/opt/homebrew/bin/brew shellenv' "${HOME}/.zprofile" 2>/dev/null; then
-    log "Adding brew shellenv to ~/.zprofile"
-    echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "${HOME}/.zprofile"
-  fi
-  # Also apply to current shell (helpful if the script continues)
-  eval "$(/opt/homebrew/bin/brew shellenv)"
+  # Wire shell env for the invoking user (zsh + bash)
+  for f in "${INV_HOME}/.zprofile" "${INV_HOME}/.bash_profile"; do
+    grep -q '/opt/homebrew/bin/brew shellenv' "$f" 2>/dev/null || \
+      echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$f"
+    chown "${INVOKER}":staff "$f" 2>/dev/null || true
+  done
 
-  # Basic hygiene
-  brew analytics off >/dev/null 2>&1 || true
-  brew update
+  # Also export to current process so subsequent steps (if any) see brew
+  sudo -u "${INVOKER}" bash -lc 'eval "$(/opt/homebrew/bin/brew shellenv)"; brew analytics off >/dev/null 2>&1 || true; brew update'
+  log "Homebrew ready."
 }
 
-main() {
-  require_arm64
+install_clt
+install_brew
 
-  # Must run with sudo so softwareupdate and chown/mkdir are non-interactive
-  if [[ "$(id -u)" -ne 0 ]]; then
-    echo "ERROR: Run with sudo: sudo bash $(basename "$0")"
-    exit 1
-  fi
-
-  # Work as the invoking user for files in $HOME
-  export SUDO_USER="${SUDO_USER:-$USER}"
-  export HOME="$(eval echo ~${SUDO_USER})"
-  export USER="${SUDO_USER}"
-
-  log "Starting install as user: ${USER} (HOME=${HOME})"
-
-  install_clt
-  install_brew
-
-  log "Done. Open a new terminal, or run: eval \"\$($(command -v brew) shellenv)\""
-}
-
-main "$@"
+log "Done."
