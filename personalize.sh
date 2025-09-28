@@ -245,6 +245,52 @@ SUCCESS "Restarted SystemUIServer"
 killall cfprefsd 2>/dev/null || true
 SUCCESS "Restarted cfprefsd"
 
+
+# ==============================================================================
+# FIX: ensure user LaunchAgents dir exists; then create+load the agent ---
+# ==============================================================================
+
+
+INFO "Setting up persistence..."
+
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LAUNCH_AGENT_PATH="$LAUNCH_AGENTS_DIR/com.user.mute-volume.plist"
+LAUNCH_LABEL="com.user.mute-volume"
+
+# 1) Create directory if missing
+/bin/mkdir -p "$LAUNCH_AGENTS_DIR"
+
+# 2) Write the plist
+/bin/cat > "$LAUNCH_AGENT_PATH" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.mute-volume</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/osascript</string>
+    <string>-e</string>
+    <string>set volume with output muted</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+# 3) Load/refresh the agent for the logged-in (console) user
+CONSOLE_UID="$(id -u "$(stat -f %Su /dev/console)")"
+/bin/launchctl bootout "gui/$CONSOLE_UID" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap "gui/$CONSOLE_UID" "$LAUNCH_AGENT_PATH"
+/bin/launchctl enable "gui/$CONSOLE_UID/$LAUNCH_LABEL"
+/bin/launchctl kickstart -k "gui/$CONSOLE_UID/$LAUNCH_LABEL"
+
+SUCCESS "Installed and loaded $LAUNCH_LABEL"
+
+
+
 # ==============================================================================
 # PERSISTENCE SETUP
 # ==============================================================================
@@ -488,6 +534,132 @@ else
     track_warning "Failed to create gray wallpaper image"
 fi
 
+
+set_wallpaper_gray() {
+  # 1) Create (or reuse) a solid mid-gray image the system can use as wallpaper.
+  #    Stored in the user's Pictures; avoids permission issues under /Library.
+  GRAY_WALL="$HOME/Pictures/wallpaper_gray_50.png"
+  if [ ! -f "$GRAY_WALL" ]; then
+    /usr/bin/sips -s format png --resampleWidth 1920 /System/Library/CoreServices/DefaultBackgroundHD.jpg --out "$GRAY_WALL" >/dev/null 2>&1
+    # Overpaint to mid-gray; Preview can't be scripted, so use sips trick: desaturate + gamma to flatten.
+    /usr/bin/sips -s saturation 0 -s brightness 0.5 "$GRAY_WALL" >/dev/null 2>&1
+  fi
+
+  # 2) Apply to every desktop/Space in the **user context** via AppleScript.
+  /usr/bin/osascript <<'APPLESCRIPT' "$GRAY_WALL"
+on run argv
+  set p to POSIX file (item 1 of argv) as alias
+  tell application "System Events"
+    repeat with d in desktops
+      try
+        set picture of d to p
+      end try
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+
+  # 3) Restart Dock so the change is immediate on all Spaces.
+  /usr/bin/killall Dock >/dev/null 2>&1 || true
+}
+
+
+# ==============================================================================
+# ENABLE TAP TO CLICK
+# ==============================================================================
+
+
+enable_tap_to_click() {
+  # Enable tap-to-click for the current (console) user and at the login window.
+  # Works on Apple Silicon, macOS Sequoia 15.x. Safe to run repeatedly.
+
+  set -euo pipefail
+
+  # Resolve the console (logged-in) username and uid even if running with sudo/root.
+  CONSOLE_USER="$(stat -f %Su /dev/console)"
+  CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+
+  write_user_defaults() {
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/defaults write com.apple.AppleMultitouchTrackpad Clicking -bool true
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad Clicking -bool true
+    # Some components read this key; set both in user and currentHost domains.
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/defaults write NSGlobalDomain com.apple.mouse.tapBehavior -int 1
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/defaults -currentHost write NSGlobalDomain com.apple.mouse.tapBehavior -int 1
+  }
+
+  write_system_defaults_for_loginwindow() {
+    # Apply at the login screen (system domain). Does not override per-user settings.
+    /usr/bin/defaults write /Library/Preferences/com.apple.AppleMultitouchTrackpad Clicking -bool true
+    /usr/bin/defaults write /Library/Preferences/com.apple.driver.AppleBluetoothMultitouch.trackpad Clicking -bool true
+    /usr/bin/defaults write /Library/Preferences/.GlobalPreferences com.apple.mouse.tapBehavior -int 1
+    /usr/bin/defaults -currentHost write /Library/Preferences/.GlobalPreferences com.apple.mouse.tapBehavior -int 1
+  }
+
+  apply_now() {
+    # Flush caches and refresh UI so the change is immediate in the user session.
+    /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/killall cfprefsd >/dev/null 2>&1 || true
+    /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/killall SystemUIServer >/dev/null 2>&1 || true
+  }
+
+  write_user_defaults
+  write_system_defaults_for_loginwindow
+  apply_now
+}
+
+
+
+# ==============================================================================
+# ENABLE SECONDARY CLICK (BOTTOM RIGHT CORNER)
+# ==============================================================================
+
+enable_secondary_click_bottom_right() {
+  # Force secondary (right) click to the bottom-right corner (not two-finger).
+  # Apple Silicon; macOS Sequoia 15.x. Idempotent.
+
+  set -euo pipefail
+
+  CONSOLE_USER="$(stat -f %Su /dev/console)"
+  CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+  U="/usr/bin/sudo -u $CONSOLE_USER"
+  PB="/usr/libexec/PlistBuddy"
+
+  # 0) Ensure the Trackpad pane is not open (it can immediately overwrite changes)
+  /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/osascript -e 'tell application "System Settings" to quit' >/dev/null 2>&1 || true
+
+  # 1) Per-device domains (built-in + Bluetooth trackpad)
+  $U /usr/bin/defaults write com.apple.AppleMultitouchTrackpad TrackpadRightClick -int 0
+  $U /usr/bin/defaults write com.apple.AppleMultitouchTrackpad TrackpadCornerSecondaryClick -int 2
+  $U /usr/bin/defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad TrackpadRightClick -int 0
+  $U /usr/bin/defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad TrackpadCornerSecondaryClick -int 2
+
+  # 2) ByHost globals that System Settings consults
+  $U /usr/bin/defaults -currentHost write NSGlobalDomain com.apple.trackpad.enableSecondaryClick -bool true
+  $U /usr/bin/defaults -currentHost write NSGlobalDomain com.apple.trackpad.trackpadCornerClickBehavior -int 1  # 1=bottom-right
+
+  # 2b) Defensive: ensure the keys exist on disk via PlistBuddy as well
+  HOST_UUID="$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | /usr/bin/awk -F\" '/IOPlatformUUID/{print $4}')"
+  BYHOST_PLIST="$HOME/Library/Preferences/ByHost/.GlobalPreferences.$HOST_UUID.plist"
+  USER_PLIST="$HOME/Library/Preferences/com.apple.AppleMultitouchTrackpad.plist"
+
+  $U $PB -c "Set :TrackpadRightClick 0" "$USER_PLIST" 2>/dev/null || $U $PB -c "Add :TrackpadRightClick integer 0" "$USER_PLIST" || true
+  $U $PB -c "Set :TrackpadCornerSecondaryClick 2" "$USER_PLIST" 2>/dev/null || $U $PB -c "Add :TrackpadCornerSecondaryClick integer 2" "$USER_PLIST" || true
+  $U $PB -c "Set :com.apple.trackpad.enableSecondaryClick true" "$BYHOST_PLIST" 2>/dev/null || $U $PB -c "Add :com.apple.trackpad.enableSecondaryClick bool true" "$BYHOST_PLIST" || true
+  $U $PB -c "Set :com.apple.trackpad.trackpadCornerClickBehavior 1" "$BYHOST_PLIST" 2>/dev/null || $U $PB -c "Add :com.apple.trackpad.trackpadCornerClickBehavior integer 1" "$BYHOST_PLIST" || true
+
+  # 3) Flush caches in the user’s GUI session so the change applies now
+  /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/killall cfprefsd  >/dev/null 2>&1 || true
+  /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/killall SystemUIServer >/dev/null 2>&1 || true
+
+  # 4) Verification (expected: 0 / 2 / 1 / 1)
+  echo "VERIFY:"
+  $U /usr/bin/defaults read com.apple.AppleMultitouchTrackpad TrackpadRightClick || true
+  $U /usr/bin/defaults read com.apple.AppleMultitouchTrackpad TrackpadCornerSecondaryClick || true
+  $U /usr/bin/defaults -currentHost read NSGlobalDomain com.apple.trackpad.enableSecondaryClick || true
+  $U /usr/bin/defaults -currentHost read NSGlobalDomain com.apple.trackpad.trackpadCornerClickBehavior || true
+}
+
+
+
 # ==============================================================================
 # SOUND SETTINGS
 # ==============================================================================
@@ -571,6 +743,13 @@ defaults write com.apple.finder ShowStatusBar -bool true
 defaults write com.apple.finder ShowPathbar -bool true
 defaults write com.apple.finder _FXShowPosixPathInTitle -bool true
 track_change "Applied additional Finder enhancements"
+
+INFO "Configuring trackpad (tap + secondary corner)..."
+enable_tap_to_click
+enable_secondary_click_bottom_right
+track_change "Enabled tap-to-click"
+track_change "Set secondary click to bottom-right corner"
+
 
 # ==============================================================================
 # APPLY CHANGES
